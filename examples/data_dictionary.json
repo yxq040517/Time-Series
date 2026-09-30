@@ -1,0 +1,26 @@
+{
+  "dataset": "server_metrics.csv",
+  "source": "synthetic",
+  "seed": 42,
+  "rows": 2400,
+  "sampling_interval": "1 minute",
+  "description": "用于演示与流程验证的合成数据，不代表真实生产故障或公开基准成绩。默认前35%训练段不含注入异常。",
+  "columns": [
+    {"name": "timestamp", "role": "time", "description": "递增的ISO时间戳"},
+    {"name": "cpu_usage", "role": "feature", "unit": "%", "description": "CPU使用率"},
+    {"name": "memory_usage", "role": "feature", "unit": "%", "description": "内存使用率"},
+    {"name": "disk_io", "role": "feature", "unit": "MB/s", "description": "磁盘吞吐量"},
+    {"name": "network_rx", "role": "feature", "unit": "MB/s", "description": "网络接收吞吐量"},
+    {"name": "latency_ms", "role": "feature", "unit": "ms", "description": "请求延迟"},
+    {"name": "error_rate", "role": "feature", "unit": "%", "description": "请求错误率"},
+    {"name": "is_anomaly", "role": "label", "description": "0正常、1人工注入异常；仅用于留出区间评估，不参与训练或阈值选择"}
+  ],
+  "injected_intervals": [
+    {"start": 1010, "end": 1048, "features": ["cpu_usage", "latency_ms"]},
+    {"start": 1280, "end": 1328, "features": ["disk_io", "network_rx"]},
+    {"start": 1550, "end": 1610, "features": ["memory_usage", "latency_ms"]},
+    {"start": 1840, "end": 1872, "features": ["latency_ms", "error_rate"]},
+    {"start": 2150, "end": 2205, "features": ["cpu_usage", "disk_io", "network_rx"]}
+  ],
+  "interval_convention": "zero-based, start inclusive, end exclusive"
+}
