@@ -2,6 +2,7 @@ import csv
 import io
 import asyncio
 from datetime import datetime, timedelta, timezone
+import uuid
 
 import numpy as np
 import pytest
@@ -9,7 +10,8 @@ import httpx
 from fastapi.testclient import TestClient
 
 from backend.app import app
-from backend.schemas import RunConfig
+from backend.schemas import Run
+from backend.storage import now
 
 
 def csv_content(headers, rows):
@@ -41,11 +43,19 @@ def dataset(client):
                                          "诊断样本", "upload")
 
 
+def historical_run(dataset):
+    run = Run(id=uuid.uuid4().hex, dataset_id=dataset.id, dataset_name=dataset.name, algorithm="pca",
+              config={"dataset_id": dataset.id, "algorithm": "pca", "train_ratio": .35},
+              status="queued", progress=0, message="历史测试记录", created_at=now())
+    with app.state.storage.connect() as db:
+        db.execute("INSERT INTO runs(id,dataset_id,payload) VALUES (?,?,?)", (run.id, dataset.id, run.model_dump_json()))
+    return run
+
+
 @pytest.fixture
 def completed_run(dataset):
     store = app.state.storage
-    config = RunConfig(dataset_id=dataset.id, algorithm="pca")
-    run = store.add_run(config, dataset)
+    run = historical_run(dataset)
     flags = np.zeros(dataset.rows, dtype=np.int8)
     flags[50:55] = 1
     flags[90:93] = 1
@@ -61,6 +71,7 @@ def completed_run(dataset):
                        "status": "unreviewed", "note": ""})
     summary = {"points": 120, "n_features": 3, "train_end": 42, "fit_end": 34, "threshold": 1.,
                "anomaly_points": 8, "anomaly_ratio": 8 / 78, "event_count": 2, "duration_ms": 2.,
+               "scored_points": 78, "warmup_points": 0,
                "explanation_method": "test", "score_stats": {"min": 0., "max": 3., "median": 0., "p95": 3.},
                "metrics": None}
     store.finish_run(run.id, output, events, summary, [])
@@ -156,7 +167,7 @@ def test_batch_review_rejects_invalid_selection_or_payload(client, completed_run
 def test_diagnostics_require_existing_dataset_and_completed_run(client, dataset):
     assert client.get("/api/datasets/missing/profile").status_code == 404
     assert client.get("/api/runs/missing/insights").status_code == 404
-    run = app.state.storage.add_run(RunConfig(dataset_id=dataset.id, algorithm="pca"), dataset)
+    run = historical_run(dataset)
     assert client.get(f"/api/runs/{run.id}/insights").status_code == 409
     assert client.post(f"/api/runs/{run.id}/events/review", json={
         "event_ids": ["e-0001"], "status": "confirmed"}).status_code == 409

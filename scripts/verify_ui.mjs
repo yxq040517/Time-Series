@@ -15,14 +15,32 @@ const errors = [];
 page.on('pageerror', error => errors.push(error.message));
 page.on('console', message => { if (message.type() === 'error' && !message.text().includes('Failed to load resource')) errors.push(message.text()); });
 const report = {};
+async function trainPublishedModel(dataset, algorithm) {
+  const response = await context.request.post(`${base}/api/trainings`, { data: { dataset_id: dataset.id, name: `Browser ${algorithm} ${Date.now()}`, algorithm,
+    fit_start: 0, fit_end: Math.floor(dataset.rows * .2), calibration_end: Math.floor(dataset.rows * .35), threshold_quantile: .99, pca_variance: .9, window: 8 } });
+  assert.equal(response.status(), 202, await response.text());
+  const submitted = await response.json();
+  for (let attempt = 0; attempt < 300; attempt++) {
+    const job = await (await context.request.get(`${base}/api/trainings/${submitted.id}`)).json();
+    assert.notEqual(job.status, 'failed', job.error || job.message);
+    if (job.status === 'completed') {
+      const published = await context.request.post(`${base}/api/models/${job.model_id}/publish`);
+      assert.equal(published.status(), 200, await published.text()); return published.json();
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.fail('training timed out');
+}
 try {
   // Real seed request ensures an old dataset is selected before testing a transition.
   const seed = await context.request.post(base + '/api/datasets/demo', { data: { seed: 42 } });
   assert.equal(seed.status(), 200);
   const seededDataset = await seed.json();
+  const pcaModel = await trainPublishedModel(seededDataset, 'pca');
   await page.goto(base, { waitUntil: 'networkidle' });
   await page.getByTestId('dataset-select').selectOption(seededDataset.id);
   await page.getByTestId('run-button').waitFor({ state: 'visible' });
+  await page.getByTestId('model-select').selectOption(pcaModel.id);
   // Delay the real request, not its result: regression for starting a run on the old dataset.
   await page.route('**/api/datasets/demo', async route => { await new Promise(resolve => setTimeout(resolve, 500)); await route.continue(); });
   const demoResponse = page.waitForResponse(response => response.url().endsWith('/api/datasets/demo') && response.request().method() === 'POST');
@@ -30,6 +48,7 @@ try {
   assert.equal(await page.getByTestId('run-button').isDisabled(), true, 'run must wait while the dataset changes');
   const demo = await (await demoResponse).json();
   await page.waitForFunction(id => document.querySelector('[data-testid="dataset-select"]')?.value === id, demo.id);
+  await page.getByTestId('model-select').selectOption(pcaModel.id);
   await page.waitForFunction(() => !document.querySelector('[data-testid="run-button"]')?.disabled);
   await page.unroute('**/api/datasets/demo');
   report.datasetTransitionGuard = true;
@@ -80,7 +99,12 @@ try {
   await page.getByTestId('file-input').setInputFiles(path.join(root, 'examples/server_metrics.csv'));
   await page.getByTestId('upload-submit').click();
   await page.getByTestId('upload-submit').waitFor({ state: 'hidden', timeout: 30000 });
-  await page.getByTestId('algorithm-select').selectOption('temporal');
+  const uploadedDatasetId = await page.getByTestId('dataset-select').inputValue();
+  const uploadedDataset = await (await context.request.get(`${base}/api/datasets/${uploadedDatasetId}`)).json();
+  const temporalModel = await trainPublishedModel(uploadedDataset, 'temporal');
+  await page.reload({ waitUntil: 'networkidle' });
+  await page.getByTestId('dataset-select').selectOption(uploadedDatasetId);
+  await page.getByTestId('model-select').selectOption(temporalModel.id);
   await page.getByTestId('run-button').click();
   await page.locator('[data-testid^="event-row-"]').first().waitFor({ state: 'visible', timeout: 45000 });
   const uploadedId = await page.getByTestId('dataset-select').inputValue();

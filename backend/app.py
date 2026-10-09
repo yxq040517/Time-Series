@@ -5,21 +5,23 @@ import logging
 import os
 import sqlite3
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+import time
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import quote
 
 import numpy as np
+import pandas as pd
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from starlette.concurrency import run_in_threadpool
 from threadpoolctl import threadpool_limits
 
 from .demo import make_demo
-from .diagnostics import dataset_profile, run_insights
-from .engine import analyze, peak_sample
-from .schemas import Annotation, BatchAnnotation, Dataset, DatasetProfile, DemoRequest, Event, Run, RunConfig, RunInsights
+from .diagnostics import dataset_profile, run_insights, sampling_profile, scored_mask
+from .engine import detect, peak_sample, summarize_detection, train_model
+from .schemas import Annotation, BatchAnnotation, Dataset, DatasetProfile, DemoRequest, DetectionConfig, Event, ModelInfo, Run, RunInsights, TrainingConfig, TrainingJob
 from .storage import MAX_UPLOAD, Storage, now
 
 LOGGER = logging.getLogger("chronolens")
@@ -33,6 +35,7 @@ async def lifespan(application: FastAPI):
     application.state.slots = threading.BoundedSemaphore(6)
     application.state.executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="chronolens")
     application.state.futures = {}
+    application.state.stream_futures = {}
     application.state.futures_lock = threading.Lock()
     # BLAS/OpenMP bounds apply process-wide; overlapping per-worker contexts are unsafe.
     limiter = threadpool_limits(limits=1)
@@ -43,12 +46,13 @@ async def lifespan(application: FastAPI):
         with application.state.futures_lock:
             for identifier, future in application.state.futures.items():
                 if future.cancelled():
-                    application.state.storage.update_run(identifier, status="failed", message="服务关闭中断分析",
-                                                         error="任务在服务关闭时取消，请重新运行。", completed_at=now())
+                    update = application.state.storage.update_training if application.state.storage.get_training(identifier) else application.state.storage.update_run
+                    update(identifier, status="failed", message="服务关闭中断任务",
+                           error="任务在服务关闭时取消，请重新提交。", completed_at=now())
         limiter.restore_original_limits()
 
 
-app = FastAPI(title="ChronoLens 时序异常检测与解释系统", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="ChronoLens 时序异常检测与解释系统", version="2.0.0", lifespan=lifespan)
 
 
 def storage() -> Storage:
@@ -60,6 +64,13 @@ def dataset_or_404(identifier: str) -> Dataset:
     if dataset is None:
         raise HTTPException(404, "数据集不存在。")
     return dataset
+
+
+def model_or_404(identifier: str) -> ModelInfo:
+    model = storage().get_model(identifier)
+    if model is None:
+        raise HTTPException(404, "模型不存在。")
+    return model
 
 
 def run_or_404(identifier: str) -> Run:
@@ -101,25 +112,124 @@ def selected_features(query: str | None, names: list[str]) -> list[str]:
     return selected
 
 
-def execute(identifier: str, config: RunConfig, dataset: Dataset):
+def execute_training(identifier: str, config: TrainingConfig, dataset: Dataset):
     store = storage()
     try:
-        store.update_run(identifier, status="running", progress=3, message="读取已验证的数据")
-        arrays = store.load_arrays("dataset", dataset.id)
-        output, events, summary, notes = analyze(arrays, dataset.features, config,
-                                                lambda value, message: store.update_run(identifier, progress=value, message=message))
-        store.finish_run(identifier, output, events, summary, notes)
+        store.update_training(identifier, status="running", progress=3, message="读取训练数据")
+        asset, summary, notes = train_model(store.load_arrays("dataset", dataset.id), dataset.features, config,
+                                            lambda value, message: store.update_training(identifier, progress=value, message=message))
+        store.finish_training(identifier, asset, summary, notes)
     except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
-        LOGGER.warning("Analysis %s rejected: %s", identifier, exc)
-        message = str(exc) if isinstance(exc, ValueError) else "数值计算不稳定，请检查数值量级并调整配置。"
-        store.update_run(identifier, status="failed", message="分析失败", error=message, completed_at=now())
+        LOGGER.warning("Training %s rejected: %s", identifier, exc)
+        store.update_training(identifier, status="failed", message="训练失败", error=str(exc), completed_at=now())
     except Exception:
-        # Job boundary: log the full unexpected error, but do not expose local paths to clients.
-        LOGGER.exception("Unexpected analysis failure: %s", identifier)
-        store.update_run(identifier, status="failed", message="分析失败",
-                         error="分析遇到内部错误；请检查服务终端日志后重试。", completed_at=now())
+        LOGGER.exception("Unexpected training failure: %s", identifier)
+        store.update_training(identifier, status="failed", message="训练失败",
+                              error="训练遇到内部错误；请检查服务终端日志。", completed_at=now())
     finally:
         app.state.slots.release()
+
+
+def stream_context(store: Storage, model: ModelInfo, config: DetectionConfig, arrays: dict):
+    state = store.get_stream(model.id, config.stream_id)
+    sampling = sampling_profile(arrays["timestamps"])
+    history, notes, cuts = None, [], []
+    if sampling["mode"] == "timestamp":
+        times = pd.to_datetime(arrays["timestamps"], utc=True, format="mixed")
+        if times.duplicated().any() or not times.is_monotonic_increasing:
+            raise ValueError("连续流时间戳必须严格递增，不允许重复、重叠或乱序。")
+        interval = sampling["median_interval_seconds"]
+        if state is not None and state["mode"] == "timestamp":
+            last = pd.Timestamp(state["last_timestamp"])
+            if times[0] <= last:
+                raise ValueError("连续流批次与已提交历史重叠或乱序；流状态未改变。")
+            gap = (int(times[0].value) - int(last.value)) / 1e9
+            expected = state.get("interval_seconds") or interval or gap
+            cadence_changed = interval is not None and expected is not None and not np.isclose(interval, expected, rtol=.01, atol=0)
+            if cadence_changed or not np.isclose(gap, expected, rtol=.01, atol=0):
+                notes.append("连续流出现采样间断，已重置历史窗口；本批次重新预热。")
+            else:
+                history = np.asarray(state["history"], dtype=float)
+            if interval is None:
+                interval = expected
+        if interval is not None:
+            deltas = np.asarray([(int(b) - int(a)) / 1e9 for a, b in zip(times.asi8[:-1], times.asi8[1:])])
+            cuts = (np.flatnonzero(~np.isclose(deltas, interval, rtol=.01, atol=0)) + 1).tolist()
+            if cuts:
+                notes.append(f"本批次有 {len(cuts)} 个采样间断；每次间断后重置窗口并重新预热。")
+        metadata = {"mode": "timestamp", "last_timestamp": str(arrays["timestamps"][-1]), "interval_seconds": interval}
+    else:
+        if state is not None and state["mode"] == "index":
+            history = np.asarray(state["history"], dtype=float)
+        metadata = {"mode": "index", "appended_points": (state.get("appended_points", 0) if state else 0) + len(arrays["values"])}
+    if state is not None and state["mode"] != sampling["mode"]:
+        notes.append("连续流采样模式改变，已重置历史窗口并重新预热。")
+    return history, metadata, notes, cuts
+
+
+def execute(identifier: str, config: DetectionConfig, dataset: Dataset, predecessor=None):
+    store = storage()
+    try:
+        if predecessor is not None:
+            try:
+                predecessor.result()
+            except CancelledError:
+                pass
+        store.update_run(identifier, status="running", progress=3, message="读取已发布模型与检测数据")
+        model = store.get_model(config.model_id)
+        if model is None:
+            raise ValueError("检测模型不存在。")
+        store.validate_detection(config, dataset, model)
+        asset = store.load_model_asset(model.id)
+        arrays = store.load_arrays("dataset", dataset.id)
+        lock = store.stream_lock(model.id, config.stream_id) if config.stream_id is not None else nullcontext()
+        with lock:
+            history, metadata, stream_notes, cuts = stream_context(store, model, config, arrays) if config.stream_id is not None else (None, None, [], [])
+            started = time.perf_counter()
+            boundaries = [0, *cuts, len(arrays["values"])]
+            outputs, notes, new_history = [], [], history
+            for segment, (left, right) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+                batch = {key: value[left:right] if len(value) else value for key, value in arrays.items()}
+                progress = lambda value, message: store.update_run(identifier,
+                    progress=min(99, 3 + int(96 * (left + (right - left) * value / 100) / dataset.rows)), message=message)
+                output, events, summary, segment_notes, new_history = detect(batch, dataset.features, asset, config,
+                    progress, history=new_history if segment == 0 else None)
+                outputs.append(output)
+                notes.extend(segment_notes)
+            if len(outputs) > 1:
+                output = {key: np.concatenate([item[key] for item in outputs], axis=0) for key in outputs[0]}
+                events, summary = summarize_detection(arrays, dataset.features, asset, config, output,
+                                                       (time.perf_counter() - started) * 1000)
+            notes = list(dict.fromkeys(notes))
+            stream_update = None
+            if metadata is not None:
+                metadata["history"] = new_history.tolist()
+                stream_update = (model.id, config.stream_id, metadata)
+            store.finish_run(identifier, output, events, summary, stream_notes + notes, stream_update=stream_update)
+    except (ValueError, FloatingPointError, np.linalg.LinAlgError) as exc:
+        LOGGER.warning("Inference %s rejected: %s", identifier, exc)
+        message = str(exc) if isinstance(exc, ValueError) else "数值计算不稳定，请检查输入数值量级。"
+        store.update_run(identifier, status="failed", message="检测失败", error=message, completed_at=now())
+    except Exception:
+        LOGGER.exception("Unexpected inference failure: %s", identifier)
+        store.update_run(identifier, status="failed", message="检测失败",
+                         error="检测遇到内部错误；请检查服务终端日志。", completed_at=now())
+    finally:
+        app.state.slots.release()
+
+
+def remember_future(identifier: str, future):
+    with app.state.futures_lock:
+        app.state.futures = {key: value for key, value in app.state.futures.items() if not value.done()}
+        app.state.stream_futures = {key: value for key, value in app.state.stream_futures.items() if not value.done()}
+        app.state.futures[identifier] = future
+
+
+def mean_contributions(values: np.ndarray) -> np.ndarray:
+    # Contributions are nonnegative; scaling avoids overflowing a long finite
+    # bucket before division by its length.
+    scale = np.maximum(values.max(axis=0), 1.)
+    return (values / scale).mean(axis=0) * scale
 
 
 @app.exception_handler(OSError)
@@ -131,7 +241,7 @@ async def io_error(request: Request, exc: OSError | sqlite3.Error):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.get("/api/datasets")
@@ -219,21 +329,87 @@ def source_csv(identifier: str):
     return csv_response(rows(), f"数据源-{dataset.id[:8]}.csv")
 
 
-@app.post("/api/runs", response_model=Run, status_code=202)
-def create_run(config: RunConfig):
+@app.post("/api/trainings", response_model=TrainingJob, status_code=202)
+def create_training(config: TrainingConfig):
     dataset = dataset_or_404(config.dataset_id)
     if not app.state.slots.acquire(blocking=False):
-        raise HTTPException(429, "分析队列已满（最多 2 个并行、4 个等待），请稍后重试。")
+        raise HTTPException(429, "任务队列已满（最多 2 个并行、4 个等待），请稍后重试。")
+    job = None
     try:
-        run = storage().add_run(config, dataset)
-        future = app.state.executor.submit(execute, run.id, config, dataset)
+        job = storage().add_training(config, dataset)
+        future = app.state.executor.submit(execute_training, job.id, config, dataset)
     except Exception:
         app.state.slots.release()
+        if job is not None:
+            storage().update_training(job.id, status="failed", message="无法调度任务", error="训练调度失败。", completed_at=now())
         raise
-    with app.state.futures_lock:
-        # Completed jobs are kept in SQLite, not retained indefinitely in memory.
-        app.state.futures = {key: value for key, value in app.state.futures.items() if not value.done()}
-        app.state.futures[run.id] = future
+    remember_future(job.id, future)
+    return job
+
+
+@app.get("/api/trainings")
+def trainings():
+    return {"items": storage().list_trainings()}
+
+
+@app.get("/api/trainings/{identifier}", response_model=TrainingJob)
+def training_detail(identifier: str):
+    job = storage().get_training(identifier)
+    if job is None:
+        raise HTTPException(404, "训练任务不存在。")
+    return job
+
+
+@app.get("/api/models")
+def models():
+    return {"items": storage().list_models()}
+
+
+@app.get("/api/models/{identifier}", response_model=ModelInfo)
+def model_detail(identifier: str):
+    return model_or_404(identifier)
+
+
+@app.post("/api/models/{identifier}/publish", response_model=ModelInfo)
+def publish_model(identifier: str):
+    model_or_404(identifier)
+    try:
+        return storage().publish_model(identifier)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/models/{identifier}/disable", response_model=ModelInfo)
+def disable_model(identifier: str):
+    model_or_404(identifier)
+    return storage().disable_model(identifier)
+
+
+@app.post("/api/runs", response_model=Run, status_code=202)
+def create_run(config: DetectionConfig):
+    dataset = dataset_or_404(config.dataset_id)
+    model = model_or_404(config.model_id)
+    try:
+        storage().validate_detection(config, dataset, model)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not app.state.slots.acquire(blocking=False):
+        raise HTTPException(429, "任务队列已满（最多 2 个并行、4 个等待），请稍后重试。")
+    run = None
+    try:
+        run = storage().add_run(config, dataset, model)
+        with app.state.futures_lock:
+            key = (model.id, config.stream_id) if config.stream_id is not None else None
+            predecessor = app.state.stream_futures.get(key) if key is not None else None
+            future = app.state.executor.submit(execute, run.id, config, dataset, predecessor)
+            if key is not None:
+                app.state.stream_futures[key] = future
+    except Exception:
+        app.state.slots.release()
+        if run is not None:
+            storage().update_run(run.id, status="failed", message="无法调度任务", error="检测调度失败。", completed_at=now())
+        raise
+    remember_future(run.id, future)
     return run
 
 
@@ -254,14 +430,16 @@ def series(identifier: str, start: int = 0, end: int | None = None,
     left, right = bounded_range(start, end, dataset.rows)
     names = selected_features(features, dataset.features)
     indices = peak_sample(output["scores"], left, right, max_points)
+    mask = scored_mask(run, output)[indices]
+    nullable = lambda array: [float(value) if scored and np.isfinite(value) else None for value, scored in zip(array, mask)]
     values, reference, contributions = {}, {}, {}
     for feature in names:
         column = dataset.features.index(feature)
-        values[feature] = output["values"][indices, column].tolist()
-        reference[feature] = output["reference"][indices, column].tolist()
-        contributions[feature] = output["contributions"][indices, column].tolist()
+        values[feature] = [float(value) if np.isfinite(value) else None for value in output["values"][indices, column]]
+        reference[feature] = nullable(output["reference"][indices, column])
+        contributions[feature] = nullable(output["contributions"][indices, column])
     return {"indices": indices.tolist(), "timestamps": source["timestamps"][indices].tolist(),
-            "scores": output["scores"][indices].tolist(), "threshold": run.summary.threshold,
+            "scores": nullable(output["scores"][indices]), "scored": mask.tolist(), "threshold": run.summary.threshold,
             "train_end": run.summary.train_end, "feature_names": names, "values": values,
             "reference": reference, "contributions": contributions, "flags": output["flags"][indices].tolist(),
             "labels": source["labels"][indices].tolist() if dataset.has_labels else None,
@@ -275,9 +453,12 @@ def heatmap(identifier: str, start: int = 0, end: int | None = None,
     left, right = bounded_range(start, end, dataset.rows)
     edges = np.linspace(left, right, min(bins, right - left) + 1, dtype=int)
     indices = edges[:-1]
-    values = np.stack([output["contributions"][a:b].mean(axis=0) for a, b in zip(edges[:-1], edges[1:])], axis=1)
+    mask = scored_mask(run, output)
+    buckets = [mean_contributions(output["contributions"][a:b][mask[a:b]]).tolist() if mask[a:b].any()
+               else [None] * len(dataset.features) for a, b in zip(edges[:-1], edges[1:])]
+    values = [list(column) for column in zip(*buckets)]
     return {"features": dataset.features, "timestamps": source["timestamps"][indices].tolist(),
-            "indices": indices.tolist(), "values": values.tolist(), "method": run.summary.explanation_method,
+            "indices": indices.tolist(), "values": values, "method": run.summary.explanation_method,
             "range": {"start": left, "end": right}}
 
 
@@ -314,7 +495,9 @@ def event_or_404(identifier: str, event_id: str) -> dict:
 def explanation(identifier: str, event_id: str):
     run, dataset, source, output = result(identifier)
     event = event_or_404(identifier, event_id)
-    contribution = output["contributions"][event["start"]:event["end"]].mean(axis=0)
+    interval = slice(event["start"], event["end"])
+    scored = output["contributions"][interval][scored_mask(run, output)[interval]]
+    contribution = mean_contributions(scored) if len(scored) else np.zeros(len(dataset.features))
     total = float(contribution.sum())
     order = np.argsort(-contribution, kind="stable")
     features = [{"name": dataset.features[j], "contribution": float(contribution[j]),
@@ -341,6 +524,7 @@ def annotate(identifier: str, event_id: str, annotation: Annotation):
 @app.get("/api/runs/{identifier}/export.csv")
 def analysis_csv(identifier: str):
     run, dataset, source, output = result(identifier)
+    mask = scored_mask(run, output)
     event_ids = np.full(dataset.rows, "", dtype=object)
     statuses = np.full(dataset.rows, "", dtype=object)
     notes = np.full(dataset.rows, "", dtype=object)
@@ -348,11 +532,12 @@ def analysis_csv(identifier: str):
         interval = slice(event["start"], event["end"])
         event_ids[interval], statuses[interval], notes[interval] = event["id"], event["status"], event["note"]
     def rows():
-        yield ["timestamp", *dataset.features, "score", "threshold", "is_anomaly", "event_id", "review_status", "review_note",
+        yield ["timestamp", *dataset.features, "scorable", "score", "threshold", "is_anomaly", "model_id", "model_version", "event_id", "review_status", "review_note",
                *(["ground_truth"] if dataset.has_labels else [])]
         for i in range(dataset.rows):
             yield [str(source["timestamps"][i]), *[float(v) if np.isfinite(v) else "" for v in source["values"][i]],
-                   float(output["scores"][i]), run.summary.threshold, int(output["flags"][i]),
+                   int(mask[i]), float(output["scores"][i]) if mask[i] else "", run.summary.threshold,
+                   int(output["flags"][i]) if mask[i] else "", run.model_id or "", run.model_version or "",
                    event_ids[i], statuses[i], notes[i], *([int(source["labels"][i])] if dataset.has_labels else [])]
     return csv_response(rows(), f"分析结果-{run.id[:8]}.csv")
 
@@ -361,7 +546,8 @@ def svg_chart(values: np.ndarray, title: str, threshold: float | None = None, tr
               second: np.ndarray | None = None) -> str:
     width, height, left, top, plot_width, plot_height = 960, 240, 70, 32, 865, 165
     combined = values if second is None else np.concatenate([values, second])
-    low, high = float(combined.min()), float(combined.max())
+    finite = combined[np.isfinite(combined)]
+    low, high = (float(finite.min()), float(finite.max())) if finite.size else (0., 1.)
     if threshold is not None:
         low, high = min(low, threshold), max(high, threshold)
     if high - low < 1e-12:
@@ -372,10 +558,20 @@ def svg_chart(values: np.ndarray, title: str, threshold: float | None = None, tr
         return left + plot_width * index / max(1, len(values) - 1)
     def y(value):
         return top + plot_height * (high - float(value)) / (high - low)
-    indices = peak_sample(values, 0, len(values), 600)
+    indices = peak_sample(np.nan_to_num(values, nan=0.), 0, len(values), 600)
     def polyline(array, color):
-        points = " ".join(f"{x(i):.2f},{y(array[i]):.2f}" for i in indices)
-        return f'<polyline points="{points}" fill="none" stroke="{color}" stroke-width="1.5"/>'
+        paths, current, previous = [], [], None
+        for i in indices:
+            if not np.isfinite(array[i]) or (previous is not None and not np.isfinite(array[previous:i + 1]).all()):
+                if current:
+                    paths.append(current)
+                current = []
+            if np.isfinite(array[i]):
+                current.append(f"{x(i):.2f},{y(array[i]):.2f}")
+            previous = i
+        if current:
+            paths.append(current)
+        return "".join(f'<polyline points="{" ".join(points)}" fill="none" stroke="{color}" stroke-width="1.5"/>' for points in paths)
     train = ""
     if train_end is not None:
         train_width = x(train_end) - left
@@ -392,15 +588,18 @@ def report(identifier: str):
     escape = lambda value: html.escape(str(value), quote=True)
     summary = run.summary
     metrics = summary.metrics
-    config_rows = "".join(f"<tr><th>{escape(k)}</th><td>{escape(v)}</td></tr>" for k, v in run.config.model_dump().items())
+    config_rows = "".join(f"<tr><th>{escape(k)}</th><td>{escape(v)}</td></tr>" for k, v in run.config.items())
+    mask = scored_mask(run, output)
+    scores = np.where(mask, output["scores"], np.nan)
+    provenance = f"模型 {escape(run.model_name)} · v{run.model_version} · {escape(run.model_id)}" if run.model_id else "历史训练检测记录（未关联已保存模型）"
     notes = "".join(f"<li>{escape(note)}</li>" for note in storage().result_notes(identifier))
     event_rows = "".join(f'''<tr><td>{escape(event['id'])}</td><td>[{event['start']}, {event['end']})<small>{escape(event['start_time'])}<br>至 {escape(event['end_time'])}（最后一个样本）</small></td><td>{event['length']} / {event['anomaly_points']}</td><td>{event['peak_score']:.5g}</td><td>{escape(event['top_feature'])}</td><td>{escape(event['severity'])}</td><td>{escape(event['status'])}</td><td class="note">{escape(event['note'])}</td></tr>''' for event in storage().events(identifier))
-    metric_section = "<p>数据未提供真实标签，不计算监督评估指标。</p>" if metrics is None else "<div class=metrics>" + "".join(f"<span>{escape(key)} <strong>{value:.4f}</strong></span>" for key, value in metrics.model_dump().items()) + "</div><p>指标仅基于训练段之后的原始逐点预测；未做 point adjustment。事件召回按真实连续标签事件与检测事件是否重叠计算。</p>"
+    metric_section = "<p>没有真实标签或没有可评分样本，不计算监督评估指标。</p>" if metrics is None else "<div class=metrics>" + "".join(f"<span>{escape(key)} <strong>{value:.4f}</strong></span>" for key, value in metrics.model_dump().items()) + "</div><p>指标仅基于可评分样本的原始逐点预测；预热点不可评分，未做 point adjustment。事件召回按真实连续标签事件与检测事件是否重叠计算。</p>"
     features = []
     for j, name in enumerate(dataset.features):
-        features.append(f"<section><h3>{escape(name)}</h3>" + svg_chart(output["values"][:, j], f"{name} · 蓝色为填充后观测，绿色为模型参考", second=output["reference"][:, j]) + "</section>")
+        features.append(f"<section><h3>{escape(name)}</h3>" + svg_chart(output["values"][:, j], f"{name} · 蓝色为填充后观测，绿色为模型参考；预热段参考不可用", second=np.where(mask, output["reference"][:, j], np.nan)) + "</section>")
     quality = "".join(f"<li>{escape(warning)}</li>" for warning in dataset.quality.warnings)
-    document = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'"><title>ChronoLens · {escape(dataset.name)}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f4f6fa;color:#243047;font:14px/1.65 system-ui,'Microsoft YaHei',sans-serif}}main{{max-width:1160px;margin:40px auto;padding:0 24px}}header,section{{background:#fff;border:1px solid #e4e8f0;border-radius:14px;padding:24px;margin-bottom:20px}}h1{{margin:6px 0;font-size:28px}}h2{{font-size:19px}}h3{{font-size:15px}}small{{display:block;color:#768197}}.tag{{color:#5267d9;font-weight:700;letter-spacing:2px}}.metrics{{display:flex;gap:24px;flex-wrap:wrap}}.metrics span{{display:grid;min-width:125px;color:#667085}}.metrics strong{{font-size:26px;color:#243047}}table{{width:100%;border-collapse:collapse;font-size:12px}}th,td{{padding:12px 8px;text-align:left;border-bottom:1px solid #edf0f5;vertical-align:top;overflow-wrap:anywhere}}th{{background:#f7f9fc}}svg{{width:100%;height:auto}}.scroll{{overflow:auto}}.note{{white-space:pre-wrap;min-width:160px;max-width:280px}}li{{margin:8px 0}}footer{{color:#667085;text-align:center;padding:20px}}@media print{{body{{background:white}}main{{margin:0}}section{{break-inside:avoid}}}}</style></head><body><main><header><div class="tag">CHRONOLENS / 分析报告</div><h1>{escape(dataset.name)}</h1><p>{escape(dataset.description)}</p><small>来源：{escape(dataset.source)} · 生成于 {escape(now())} · 任务 {escape(run.id)}</small></header><section><h2>分析摘要</h2><div class="metrics"><span>评估段异常点<strong>{summary.anomaly_points}</strong></span><span>评估段异常比例<strong>{summary.anomaly_ratio:.2%}</strong></span><span>异常事件<strong>{summary.event_count}</strong></span><span>历史校准阈值<strong>{summary.threshold:.5g}</strong></span><span>分析耗时<strong>{summary.duration_ms / 1000:.2f}s</strong></span></div><p>{dataset.rows} 行 · {summary.n_features} 变量 · 算法 {escape(run.algorithm)}</p><p>解释方法：{escape(summary.explanation_method)}</p><ul>{notes}</ul></section><section><h2>异常分数概览</h2>{svg_chart(output['scores'], '异常分数 · 保留分桶峰值的真实样本', summary.threshold, summary.train_end)}</section><section><h2>评估指标</h2>{metric_section}</section><section><h2>异常事件与人工审核</h2><p>索引区间左闭右开；合并间隙内可能包含正常点。人工审核不更改模型分数或真实标签。</p><div class="scroll"><table><thead><tr><th>事件</th><th>索引 / 时间</th><th>跨度 / 异常点</th><th>峰值</th><th>主要偏差变量</th><th>相对严重度</th><th>审核</th><th>备注</th></tr></thead><tbody>{event_rows or '<tr><td colspan="8">未发现达到最小事件跨度的异常事件。</td></tr>'}</tbody></table></div></section>{''.join(features)}<section><h2>分析配置</h2><table>{config_rows}</table><h3>数据质量</h3><ul>{quality or '<li>导入时未发现缺失、重复时间或常量特征。</li>'}</ul><p>原始缺失值在分析图中由历史拟合段中位数填充；CSV 导出保留原始缺失单元格。</p></section><footer>本报告完全离线，不加载外部脚本、字体或网络资源。特征偏差不是因果根因结论。</footer></main></body></html>'''
+    document = f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'"><title>ChronoLens · {escape(dataset.name)}</title><style>*{{box-sizing:border-box}}body{{margin:0;background:#f4f6fa;color:#243047;font:14px/1.65 system-ui,'Microsoft YaHei',sans-serif}}main{{max-width:1160px;margin:40px auto;padding:0 24px}}header,section{{background:#fff;border:1px solid #e4e8f0;border-radius:14px;padding:24px;margin-bottom:20px}}h1{{margin:6px 0;font-size:28px}}h2{{font-size:19px}}h3{{font-size:15px}}small{{display:block;color:#768197}}.tag{{color:#5267d9;font-weight:700;letter-spacing:2px}}.metrics{{display:flex;gap:24px;flex-wrap:wrap}}.metrics span{{display:grid;min-width:125px;color:#667085}}.metrics strong{{font-size:26px;color:#243047}}table{{width:100%;border-collapse:collapse;font-size:12px}}th,td{{padding:12px 8px;text-align:left;border-bottom:1px solid #edf0f5;vertical-align:top;overflow-wrap:anywhere}}th{{background:#f7f9fc}}svg{{width:100%;height:auto}}.scroll{{overflow:auto}}.note{{white-space:pre-wrap;min-width:160px;max-width:280px}}li{{margin:8px 0}}footer{{color:#667085;text-align:center;padding:20px}}@media print{{body{{background:white}}main{{margin:0}}section{{break-inside:avoid}}}}</style></head><body><main><header><div class="tag">CHRONOLENS / 检测报告</div><h1>{escape(dataset.name)}</h1><p>{escape(dataset.description)}</p><p>{provenance}</p><small>来源：{escape(dataset.source)} · 生成于 {escape(now())} · 任务 {escape(run.id)}</small></header><section><h2>检测摘要</h2><div class="metrics"><span>可评分异常点<strong>{summary.anomaly_points}</strong></span><span>可评分异常比例<strong>{summary.anomaly_ratio:.2%}</strong></span><span>异常事件<strong>{summary.event_count}</strong></span><span>已保存校准阈值<strong>{summary.threshold:.5g}</strong></span><span>检测耗时<strong>{summary.duration_ms / 1000:.2f}s</strong></span></div><p>{dataset.rows} 行 · {summary.n_features} 变量 · 算法 {escape(run.algorithm)} · 可评分 {summary.scored_points} 点 · 预热/不可评分 {summary.warmup_points} 点</p><p>解释方法：{escape(summary.explanation_method)}</p><ul>{notes}</ul></section><section><h2>异常分数概览</h2><p>空白段不可评分/预热，不代表正常。新检测不拟合模型、不调整阈值。</p>{svg_chart(scores, '异常分数 · 保留分桶峰值的真实样本', summary.threshold, summary.train_end)}</section><section><h2>评估指标</h2>{metric_section}</section><section><h2>异常事件与人工审核</h2><p>索引区间左闭右开；合并间隙内可能包含正常点。人工审核不更改模型分数或真实标签。</p><div class="scroll"><table><thead><tr><th>事件</th><th>索引 / 时间</th><th>跨度 / 异常点</th><th>峰值</th><th>主要偏差变量</th><th>相对严重度</th><th>审核</th><th>备注</th></tr></thead><tbody>{event_rows or '<tr><td colspan="8">未发现达到最小事件跨度的异常事件。</td></tr>'}</tbody></table></div></section>{''.join(features)}<section><h2>检测配置</h2><table>{config_rows}</table><h3>数据质量</h3><ul>{quality or '<li>导入时未发现缺失、重复时间或常量特征。</li>'}</ul><p>原始缺失值在图中由已保存模型的拟合中位数填充；CSV 导出保留原始缺失单元格。</p></section><footer>本报告完全离线，不加载外部脚本、字体或网络资源。特征偏差不是因果根因结论。</footer></main></body></html>'''
     return HTMLResponse(document, headers={"Content-Disposition": f"attachment; filename=\"chronolens-report.html\"; filename*=UTF-8''{quote('分析报告-' + run.id[:8] + '.html')}"})
 
 

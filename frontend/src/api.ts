@@ -1,4 +1,4 @@
-import type { AnomalyEvent, Dataset, DatasetProfile, RunInsights, Explanation, Heatmap, Preview, ReviewStatus, Run, RunConfig, SampleRange, Series } from './types';
+import type { AnomalyEvent, Dataset, DatasetProfile, RunInsights, Explanation, Heatmap, Preview, ReviewStatus, Run, DetectionConfig, ModelInfo, TrainingConfig, TrainingJob, SampleRange, Series } from './types';
 
 async function errorMessage(response: Response): Promise<string> {
   let message = `请求失败（HTTP ${response.status}）`;
@@ -35,11 +35,17 @@ export const api = {
   insights: (id: string, signal?: AbortSignal) => request<RunInsights>(`${runPath(id)}/insights`, { signal }),
   batchReview: (id: string, event_ids: string[], status: ReviewStatus) => request<{ items: AnomalyEvent[] }>(`${runPath(id)}/events/review`, json({ event_ids, status })),
   datasets: (signal?: AbortSignal) => request<{ items: Dataset[] }>('/datasets', { signal }),
+  models: (signal?: AbortSignal) => request<{ items: ModelInfo[] }>('/models', { signal }),
+  trainings: (signal?: AbortSignal) => request<{ items: TrainingJob[] }>('/trainings', { signal }),
+  training: (id: string, signal?: AbortSignal) => request<TrainingJob>(`/trainings/${encodeURIComponent(id)}`, { signal }),
+  createTraining: (config: TrainingConfig, signal?: AbortSignal) => request<TrainingJob>('/trainings', { ...json(config), signal }),
+  publishModel: (id: string, signal?: AbortSignal) => request<ModelInfo>(`/models/${encodeURIComponent(id)}/publish`, { ...json({}), signal }),
+  disableModel: (id: string, signal?: AbortSignal) => request<ModelInfo>(`/models/${encodeURIComponent(id)}/disable`, { ...json({}), signal }),
   demo: () => request<Dataset>('/datasets/demo', json({ seed: 42 })),
   upload: (form: FormData) => request<Dataset>('/datasets/upload', { method: 'POST', body: form }),
   preview: (id: string, signal?: AbortSignal) => request<Preview>(`/datasets/${encodeURIComponent(id)}/preview?limit=8`, { signal }),
   runs: (datasetId: string, signal?: AbortSignal) => request<{ items: Run[] }>(`/runs?${new URLSearchParams({ dataset_id: datasetId })}`, { signal }),
-  createRun: (config: RunConfig) => request<Run>('/runs', json(config)),
+  createRun: (config: DetectionConfig) => request<Run>('/runs', json(config)),
   run: (id: string, signal?: AbortSignal) => request<Run>(runPath(id), { signal }),
   series: (id: string, range: SampleRange, features: string[], signal?: AbortSignal) => {
     const query = new URLSearchParams({ start: String(range.start), end: String(range.end), max_points: '1600' });

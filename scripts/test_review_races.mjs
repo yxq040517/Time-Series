@@ -17,14 +17,15 @@ const dataset = {
   quality: { missing_cells: 0, missing_ratio: 0, duplicate_timestamps: 0,
     constant_features: [], ignored_columns: [], warnings: [] },
 };
-const config = { dataset_id: datasetId, algorithm: 'pca', train_ratio: .35, threshold_quantile: .99,
-  pca_variance: .9, window: 8, min_event_length: 3, merge_gap: 2 };
-const summary = { points: 120, n_features: 2, train_end: 42, fit_end: 34, threshold: 1,
-  anomaly_points: 5, anomaly_ratio: 5 / 78, event_count: 1, duration_ms: 25,
+const modelId = '33333333333333333333333333333333';
+const config = { dataset_id: datasetId, model_id: modelId, min_event_length: 3, merge_gap: 2 };
+const summary = { points: 120, n_features: 2, scored_points: 120, warmup_points: 0, threshold: 1,
+  anomaly_points: 5, anomaly_ratio: 5 / 120, event_count: 1, duration_ms: 25,
   explanation_method: 'PCA 标准化重构残差平方（非因果解释）',
   score_stats: { min: .2, max: 3, median: .2, p95: 3 }, metrics: null };
 const run = { id: runId, dataset_id: datasetId, dataset_name: dataset.name, algorithm: 'pca',
-  config, status: 'completed', progress: 100, message: '分析完成', created_at: timestamp(0),
+  config, model_id: modelId, model_name: '复核竞态模型', model_version: 1,
+  status: 'completed', progress: 100, message: '检测完成', created_at: timestamp(0),
   completed_at: timestamp(1), error: null, summary };
 const originalEvent = { id: eventId, start: 60, end: 65, start_time: timestamp(60), end_time: timestamp(64),
   length: 5, anomaly_points: 5, peak_score: 3, mean_score: 3, severity: 'high',
@@ -59,6 +60,7 @@ async function scenario({ holdExplanation = false } = {}) {
     }
     assert.equal(request.method(), 'GET', `Unexpected API mutation: ${request.method()} ${path}`);
     if (path === '/api/datasets') return fulfill({ items: [dataset] });
+    if (path === '/api/models') return fulfill({ items: [] });
     if (path === `/api/datasets/${datasetId}/preview`) return fulfill({ columns: ['timestamp', ...featureNames],
       rows: Array.from({ length: 8 }, (_, index) => ({ timestamp: timestamp(index), signal_a: index, signal_b: index * 2 })) });
     if (path === '/api/runs') return fulfill({ items: [run] });
@@ -78,7 +80,7 @@ async function scenario({ holdExplanation = false } = {}) {
     if (path === `/api/runs/${runId}/insights`) return fulfill({ run_id: runId,
       review: { unreviewed: 1, confirmed: 0, false_positive: 0 }, severity: { high: 1, medium: 0, low: 0 },
       top_features: [{ name: featureNames[0], event_count: 1 }],
-      timeline: [{ start: 42, end: 120, label: timestamp(42), anomaly_points: 5, total_points: 78 }] });
+      timeline: [{ start: 0, end: 120, label: timestamp(0), anomaly_points: 5, total_points: 120 }] });
     if (path === `/api/runs/${runId}/series`) {
       const start = Number(url.searchParams.get('start') || 0);
       const end = Number(url.searchParams.get('end') || 120);
@@ -87,7 +89,7 @@ async function scenario({ holdExplanation = false } = {}) {
       const entries = transform => Object.fromEntries(features.map(name => [name, indices.map(transform)]));
       const flags = indices.map(index => Number(index >= 60 && index < 65));
       return fulfill({ indices, timestamps: indices.map(timestamp), scores: flags.map(value => value ? 3 : .2),
-        threshold: 1, train_end: 42, feature_names: features, values: entries(index => Math.sin(index / 5)),
+        threshold: 1, train_end: null, scored: indices.map(() => true), feature_names: features, values: entries(index => Math.sin(index / 5)),
         reference: entries(index => Math.sin(index / 5) * .9), contributions: entries(index => index >= 60 && index < 65 ? 3 : .2),
         flags, labels: null, sampling: { total_points: indices.length, returned_points: indices.length } });
     }

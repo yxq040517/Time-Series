@@ -24,7 +24,7 @@ export function ScoreChart({ data, range, onRange }: { data: Series; range: Samp
   const option = useMemo<EChartsOption>(() => {
     const startPosition = Math.max(0, data.indices.findIndex((index) => index >= range.start));
     const endPosition = Math.max(startPosition, data.indices.reduce((last, index, position) => index < range.end ? position : last, -1));
-    const trainingLast = data.indices.reduce((last, index, position) => index < data.train_end ? position : last, -1);
+    const trainingLast = data.train_end == null ? -1 : data.indices.reduce((last, index, position) => index < data.train_end! ? position : last, -1);
     return {
       ...common, grid: { left: 62, right: 24, top: 36, bottom: 76 },
       legend: { top: 0, right: 20, icon: 'roundRect', itemWidth: 14, itemHeight: 9, textStyle: { color: '#526477', fontSize: 12 } },
@@ -35,18 +35,20 @@ export function ScoreChart({ data, range, onRange }: { data: Series; range: Samp
         const item: unknown = rows[0];
         if (!item || typeof item !== 'object' || !('dataIndex' in item) || typeof item.dataIndex !== 'number') return '';
         const position = item.dataIndex;
-        return `${timeLabel(data.timestamps[position])} · 样本 #${data.indices[position]}\n异常分数：${data.scores[position].toPrecision(5)}\n校准阈值：${data.threshold.toPrecision(5)}\n检测判断：${data.flags[position] ? '异常点' : '正常点'}${data.labels ? `\n真值标签：${data.labels[position] ? '异常' : '正常'}` : ''}`;
+        const scored = data.scored[position];
+        return `${timeLabel(data.timestamps[position])} · 样本 #${data.indices[position]}\n异常分数：${scored ? data.scores[position]?.toPrecision(5) ?? '不可评分' : '不可评分 / 预热'}\n固定校准阈值：${data.threshold.toPrecision(5)}\n检测判断：${!scored ? '不可评分 / 预热（不能视为正常）' : data.flags[position] ? '异常点' : '正常点'}${data.labels ? `\n真值标签：${data.labels[position] ? '异常' : '正常'}` : ''}`;
       } },
       dataZoom: [
         { type: 'inside', startValue: startPosition, endValue: endPosition, filterMode: 'none', throttle: 180 },
         { type: 'slider', bottom: 12, height: 24, startValue: startPosition, endValue: endPosition, borderColor: '#dce5e8', fillerColor: 'rgba(17,151,133,.14)', handleStyle: { color: teal }, textStyle: { color: '#64748b', fontSize: 12 }, filterMode: 'none', throttle: 180 },
       ],
       series: [
-        { name: '异常分数', type: 'line', data: data.scores, symbol: 'none', lineStyle: { color: teal, width: 2.2 }, itemStyle: { color: teal }, areaStyle: { color: 'rgba(17,151,133,.08)' },
+        { name: '异常分数', type: 'line', data: data.scores.map((score, position) => data.scored[position] ? score : null), connectNulls: false, symbol: 'none', lineStyle: { color: teal, width: 2.2 }, itemStyle: { color: teal }, areaStyle: { color: 'rgba(17,151,133,.08)' },
           markLine: { symbol: 'none', label: { formatter: '校准阈值', color: '#b85a36', fontSize: 12, position: 'insideEndTop' }, lineStyle: { color: anomaly, type: 'dashed', width: 1.5 }, data: [{ yAxis: data.threshold }] },
           markArea: trainingLast >= 0 ? { silent: true, itemStyle: { color: 'rgba(83,105,204,.08)' }, label: { show: true, color: '#5369aa', fontSize: 12, position: 'insideTopLeft' }, data: [[{ name: '历史训练区间', xAxis: '0' }, { xAxis: String(data.indices[trainingLast]) }]] } : undefined,
         },
-        { name: '超阈值点', type: 'scatter', symbolSize: 6, itemStyle: { color: anomaly }, data: data.scores.map((score, position) => data.flags[position] ? score : null), z: 4 },
+        { name: '超阈值点', type: 'scatter', symbolSize: 6, itemStyle: { color: anomaly }, data: data.scores.map((score, position) => data.scored[position] && data.flags[position] ? score : null), z: 4 },
+        { name: '不可评分 / 预热', type: 'scatter', symbol: 'diamond', symbolSize: 6, itemStyle: { color: '#94a3b8' }, data: data.scored.map(scored => scored ? null : 0), z: 4 },
       ],
     };
   }, [data, range]);
@@ -60,24 +62,30 @@ export function ScoreChart({ data, range, onRange }: { data: Series; range: Samp
     const end = data.indices[Math.max(0, Math.min(data.indices.length - 1, Math.round(finish)))] + 1;
     if (start !== undefined && end > start) onRange({ start, end });
   };
-  return <Chart option={option} height={300} label="异常分数、阈值与历史训练区间，拖动下方滑块联动分析范围" onEvents={{ datazoom: onZoom }} />;
+  return <Chart option={option} height={300} label="异常分数、固定阈值与不可评分预热点；仅旧版历史显示训练区间，拖动下方滑块联动分析范围" onEvents={{ datazoom: onZoom }} />;
 }
 export function ContributionChart({ data, onFeature }: { data: Heatmap; onFeature: (name: string) => void }) {
   const option = useMemo<EChartsOption>(() => {
     const cells: [number, number, number][] = [];
+    const unknown: [number, number, number][] = [];
     let maximum = 0;
-    data.values.forEach((row, featureIndex) => row.forEach((value, position) => { cells.push([position, featureIndex, value]); maximum = Math.max(maximum, value); }));
+    data.values.forEach((row, featureIndex) => row.forEach((value, position) => {
+      if (value == null) unknown.push([position, featureIndex, 0]);
+      else { cells.push([position, featureIndex, value]); maximum = Math.max(maximum, value); }
+    }));
     return {
       ...common, grid: { left: Math.min(180, Math.max(100, ...data.features.map((name) => name.length * 9))), right: 28, top: 12, bottom: 65 },
       tooltip: { ...common.tooltip, trigger: 'item', formatter: (params: unknown) => {
         if (!params || typeof params !== 'object' || !('data' in params) || !Array.isArray(params.data)) return '';
         const [position, feature, value] = params.data;
-        return `${data.features[Number(feature)]}\n${timeLabel(data.timestamps[Number(position)])}\n样本 #${data.indices[Number(position)]}\n偏离贡献：${Number(value).toPrecision(4)}`;
+        const unscored = data.values[Number(feature)]?.[Number(position)] == null;
+        return `${data.features[Number(feature)]}\n${timeLabel(data.timestamps[Number(position)])}\n样本 #${data.indices[Number(position)]}\n${unscored ? '不可评分 / 预热（无贡献，不代表正常）' : `偏离贡献：${Number(value).toPrecision(4)}`}`;
       } },
       xAxis: { type: 'category', data: data.indices.map(String), axisTick: { show: false }, axisLine: { show: false }, splitArea: { show: true }, axisLabel: { ...axisLabel, formatter: (value: string) => `#${integer.format(Number(value))}` } },
       yAxis: { type: 'category', data: data.features, inverse: true, axisLine: { show: false }, axisTick: { show: false }, axisLabel: { ...axisLabel, width: 155, overflow: 'truncate', color: '#526477' } },
-      visualMap: { min: 0, max: maximum || 1, orient: 'horizontal', left: 'center', bottom: 0, itemWidth: 12, itemHeight: 145, calculable: true, precision: 2, text: ['较高偏离', '较低偏离'], textStyle: { fontSize: 12, color: '#64748b' }, inRange: { color: ['#eef5f3', '#c6e3dc', '#87cbbc', '#3caf99', '#176c68'] } },
-      series: [{ type: 'heatmap', data: cells, progressive: 2000, emphasis: { itemStyle: { borderColor: '#15273c', borderWidth: 1 } } }],
+      visualMap: { seriesIndex: 0, min: 0, max: maximum || 1, orient: 'horizontal', left: 'center', bottom: 0, itemWidth: 12, itemHeight: 145, calculable: true, precision: 2, text: ['较高偏离', '较低偏离'], textStyle: { fontSize: 12, color: '#64748b' }, inRange: { color: ['#eef5f3', '#c6e3dc', '#87cbbc', '#3caf99', '#176c68'] } },
+      series: [{ type: 'heatmap', data: cells, progressive: 2000, emphasis: { itemStyle: { borderColor: '#15273c', borderWidth: 1 } } },
+        { name: '不可评分 / 预热', type: 'heatmap', data: unknown, itemStyle: { color: '#e2e8f0', borderColor: '#cbd5e1', borderWidth: 1 } }],
     };
   }, [data]);
   return <Chart option={option} height={Math.min(570, Math.max(240, data.features.length * 29 + 100))} label="各变量偏离贡献热力图，点击选择变量" onEvents={{ click: (params: unknown) => {
@@ -96,11 +104,11 @@ export function FeatureChart({ data, feature, isolation }: { data: Series; featu
       const first: unknown = Array.isArray(params) ? params[0] : null;
       if (!first || typeof first !== 'object' || !('dataIndex' in first) || typeof first.dataIndex !== 'number') return '';
       const index = first.dataIndex;
-      return `${feature}\n${timeLabel(data.timestamps[index])} · #${data.indices[index]}\n原始值：${data.values[feature]?.[index]?.toPrecision(5) ?? '无数据'}\n${isolation ? '稳健中位数参考' : '模型参考'}：${data.reference[feature]?.[index]?.toPrecision(5) ?? '无数据'}`;
+      return `${feature}\n${timeLabel(data.timestamps[index])} · #${data.indices[index]}\n原始值：${data.values[feature]?.[index]?.toPrecision(5) ?? '无数据'}\n${isolation ? '稳健中位数参考' : '模型参考'}：${data.scored[index] ? data.reference[feature]?.[index]?.toPrecision(5) ?? '无数据' : '不可评分 / 预热（不能视为正常）'}`;
     } },
     series: [
       { name: '原始观测', type: 'line', data: data.values[feature] || [], symbol: 'none', lineStyle: { color: teal, width: 2 }, itemStyle: { color: teal } },
-      { name: isolation ? '稳健中位数' : '模型参考', type: 'line', data: data.reference[feature] || [], symbol: 'none', lineStyle: { color: indigo, width: 2, type: 'dashed' }, itemStyle: { color: indigo } },
+      { name: isolation ? '稳健中位数' : '模型参考', type: 'line', data: (data.reference[feature] || []).map((value, index) => data.scored[index] ? value : null), connectNulls: false, symbol: 'none', lineStyle: { color: indigo, width: 2, type: 'dashed' }, itemStyle: { color: indigo } },
     ],
   }), [data, feature, isolation]);
   return <Chart option={option} height={260} label={`${feature} 原始观测与${isolation ? '稳健中位数' : '模型参考'}曲线`} />;
