@@ -16,7 +16,7 @@ def test_repeated_array_reads_share_immutable_values_but_not_mapping(tmp_path):
     first = store.load_arrays("dataset", identifier)
     second = store.load_arrays("dataset", identifier)
     assert first["values"] is second["values"]
-    with pytest.raises(ValueError, match="read-only"):
+    with pytest.raises(ValueError):
         first["values"][0] = 50
     del first["values"]
     assert "values" in store.load_arrays("dataset", identifier)

@@ -1,29 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-const presets = await import('../frontend/src/components/runPresets.ts');
 const preview = await import('../frontend/src/components/csvPreview.ts');
 
-test('balanced preset retains the original calibration defaults', () => {
-  assert.equal(typeof presets.getRunPresetConfig, 'function', 'parameter presets are available');
-  assert.deepEqual(presets.getRunPresetConfig('balanced', 'dataset-a'), {
-    dataset_id: 'dataset-a', algorithm: 'pca', train_ratio: 0.35, threshold_quantile: 0.99,
-    pca_variance: 0.9, window: 8, min_event_length: 3, merge_gap: 2,
-  });
-});
-
-test('sensitive and quiet presets change actual event parameters without changing the chosen model', () => {
-  assert.equal(typeof presets.getRunPresetConfig, 'function', 'parameter presets are available');
-  const sensitive = presets.getRunPresetConfig('sensitive', 'dataset-b', 'temporal');
-  const quiet = presets.getRunPresetConfig('quiet', 'dataset-b', 'temporal');
-  assert.equal(sensitive.algorithm, 'temporal');
-  assert.equal(quiet.algorithm, 'temporal');
-  assert.ok(sensitive.threshold_quantile < 0.99);
-  assert.equal(sensitive.min_event_length, 1);
-  assert.ok(quiet.threshold_quantile > 0.99);
-  assert.ok(quiet.min_event_length > 3);
-  assert.equal(sensitive.dataset_id, 'dataset-b');
-});
 
 test('UTF-8 BOM CSV header preview keeps commas and escaped quotes inside column names', async () => {
   assert.equal(typeof preview.readCsvPreview, 'function', 'CSV preview is available');

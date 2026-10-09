@@ -16,7 +16,19 @@ try {
   assert.equal(seed.status(),200);
   const seededDataset=await seed.json();
   for(const algorithm of ['pca','temporal','isolation']){
-    const creation=await page.request.post(`${base}/api/runs`,{data:{dataset_id:seededDataset.id,algorithm}});
+    const submitted=await page.request.post(`${base}/api/trainings`,{data:{dataset_id:seededDataset.id,name:`Upgrade ${algorithm} ${Date.now()}`,algorithm,
+      fit_start:0,fit_end:Math.floor(seededDataset.rows*.2),calibration_end:Math.floor(seededDataset.rows*.35),threshold_quantile:.99,pca_variance:.9,window:8}});
+    assert.equal(submitted.status(),202,await submitted.text());
+    const training=await submitted.json();let modelId;
+    for(let attempt=0;attempt<300;attempt++){
+      const job=await(await page.request.get(`${base}/api/trainings/${training.id}`)).json();
+      assert.notEqual(job.status,'failed',job.error||job.message);
+      if(job.status==='completed'){modelId=job.model_id;break;}
+      await new Promise(resolve=>setTimeout(resolve,100));
+    }
+    assert.ok(modelId,'training must finish with a model');
+    const publication=await page.request.post(`${base}/api/models/${modelId}/publish`);assert.equal(publication.status(),200);
+    const creation=await page.request.post(`${base}/api/runs`,{data:{dataset_id:seededDataset.id,model_id:modelId,min_event_length:3,merge_gap:2}});
     assert.equal(creation.status(),202);
     const created=await creation.json();
     let status=created.status;
@@ -37,7 +49,7 @@ try {
   await page.getByTestId('profile-search').fill(dataset.features[0]);
   assert.ok(await page.getByTestId('profile-table').locator('tbody tr').count()>=1);
   evidence.profile=true;
-  await page.getByRole('button',{name:'模型对比',exact:true}).click();
+  await page.getByRole('button',{name:'检测任务对比',exact:true}).click();
   const runs=await (await page.request.get(`${base}/api/runs?dataset_id=${id}`)).json();
   const completed=runs.items.filter(r=>r.status==='completed');
   assert.ok(completed.length>=2);
@@ -79,7 +91,7 @@ try {
   assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+2),false);
   for(const width of [390,768]){
     await page.setViewportSize({width,height:844});
-    for(const name of ['分析工作台','数据诊断','模型对比','数据集管理','检测历史']){
+    for(const name of ['分析工作台','数据诊断','检测任务对比','数据集管理','检测历史']){
       await page.getByRole('button',{name,exact:true}).click();
       await page.waitForTimeout(200);
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+2),false,`overflow ${name} ${width}`);

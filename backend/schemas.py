@@ -30,15 +30,76 @@ class Dataset(StrictModel):
     quality: Quality
 
 
-class RunConfig(StrictModel):
-    dataset_id: str
+class TrainingConfig(StrictModel):
+    dataset_id: str = Field(min_length=1, strict=True)
+    name: str = Field(min_length=1, max_length=200, strict=True)
     algorithm: Literal["pca", "temporal", "isolation"]
-    train_ratio: float = Field(default=.35, ge=.15, le=.7)
-    threshold_quantile: float = Field(default=.99, ge=.90, le=.9999)
-    pca_variance: float = Field(default=.9, ge=.5, le=.99)
+    fit_start: int = Field(default=0, ge=0, strict=True)
+    fit_end: int | None = Field(default=None, ge=1, strict=True)
+    calibration_end: int | None = Field(default=None, ge=2, strict=True)
+    threshold_quantile: float = Field(default=.99, ge=.90, le=.9999, strict=True)
+    pca_variance: float = Field(default=.9, ge=.5, le=.99, strict=True)
     window: int = Field(default=8, ge=2, le=32, strict=True)
+
+    @field_validator("name")
+    @classmethod
+    def valid_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("模型名称不能为空。")
+        return value
+
+
+class DetectionConfig(StrictModel):
+    dataset_id: str = Field(min_length=1, strict=True)
+    model_id: str = Field(min_length=1, strict=True)
     min_event_length: int = Field(default=3, ge=1, le=50, strict=True)
     merge_gap: int = Field(default=2, ge=0, le=20, strict=True)
+    stream_id: str | None = Field(default=None, min_length=1, max_length=100, strict=True)
+
+    @field_validator("stream_id")
+    @classmethod
+    def valid_stream(cls, value: str | None) -> str | None:
+        if value is not None and (not value.strip() or any(ord(c) < 32 for c in value)):
+            raise ValueError("流标识不能为空或包含控制字符。")
+        return value
+
+
+class TrainingJob(StrictModel):
+    id: str
+    dataset_id: str
+    dataset_name: str
+    config: TrainingConfig
+    status: Literal["queued", "running", "completed", "failed"]
+    progress: int = Field(ge=0, le=100)
+    message: str
+    created_at: str
+    completed_at: str | None = None
+    error: str | None = None
+    model_id: str | None = None
+
+
+class ModelInfo(StrictModel):
+    id: str
+    name: str
+    version: int
+    algorithm: Literal["pca", "temporal", "isolation"]
+    features: list[str]
+    status: Literal["ready", "published", "disabled"]
+    created_at: str
+    training_id: str
+    dataset_id: str
+    dataset_name: str
+    fit_start: int
+    fit_end: int
+    calibration_end: int
+    threshold: float
+    window: int
+    training_config: TrainingConfig
+    training_summary: dict
+    notes: list[str]
+    format_version: int
+    sklearn_version: str
 
 
 class Metrics(StrictModel):
@@ -59,15 +120,17 @@ class ScoreStats(StrictModel):
 class Summary(StrictModel):
     points: int
     n_features: int
-    train_end: int
-    fit_end: int
+    train_end: int | None = None
+    fit_end: int | None = None
+    scored_points: int
+    warmup_points: int
     threshold: float
     anomaly_points: int
     anomaly_ratio: float
     event_count: int
     duration_ms: float
     explanation_method: str
-    score_stats: ScoreStats
+    score_stats: ScoreStats | None
     metrics: Metrics | None
 
 
@@ -76,7 +139,10 @@ class Run(StrictModel):
     dataset_id: str
     dataset_name: str
     algorithm: Literal["pca", "temporal", "isolation"]
-    config: RunConfig
+    config: dict
+    model_id: str | None = None
+    model_name: str | None = None
+    model_version: int | None = None
     status: Literal["queued", "running", "completed", "failed"]
     progress: int = Field(ge=0, le=100)
     message: str

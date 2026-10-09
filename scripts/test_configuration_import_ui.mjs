@@ -10,16 +10,6 @@ try {
   await page.request.post(base + '/api/datasets/demo', { data: { seed: 42 } });
   await page.goto(base, { waitUntil: 'networkidle' });
   await page.getByTestId('run-button').waitFor();
-  const sensitive = page.getByRole('button', { name: '敏感发现', exact: true });
-  assert.equal(await sensitive.count(), 1, 'the configuration offers an actionable sensitivity preset');
-  await sensitive.click();
-  assert.equal(await page.getByRole('spinbutton', { name: '阈值分位数', exact: true }).inputValue(), '97.5');
-  await page.locator('.advanced summary').click();
-  assert.equal(await page.getByRole('spinbutton', { name: '最短事件长度', exact: true }).inputValue(), '1');
-  await page.getByRole('button', { name: '低噪复核', exact: true }).click();
-  assert.equal(await page.getByRole('spinbutton', { name: '阈值分位数', exact: true }).inputValue(), '99.5');
-  await page.getByRole('button', { name: '默认平衡', exact: true }).click();
-  assert.equal(await page.getByRole('spinbutton', { name: '历史训练比例', exact: true }).inputValue(), '35');
   await page.getByTestId('import-button').first().click();
   const csv = '自定义时间,"cpu,load",memory,自定义标签\n' + Array.from({ length: 120 }, (_, i) => `2026-01-01T00:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z,${10 + i / 10},${20 + i / 5},0`).join('\n');
   const transfer = await page.evaluateHandle(text => {
@@ -46,5 +36,5 @@ try {
   await page.locator('.import-dialog [role="alert"]').waitFor();
   assert.equal(await page.getByTestId('dataset-select').inputValue(), dataset.id);
   assert.deepEqual(errors, []);
-  console.log('Presets, bounded header preview, mapped drag-and-drop upload and failed upload retention passed.');
+  console.log('Bounded header preview, mapped drag-and-drop upload and failed upload retention passed.');
 } finally { await browser.close(); }

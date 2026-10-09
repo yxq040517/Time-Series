@@ -65,7 +65,7 @@ export function ImportDialog({ onClose, onImported }: { onClose: () => void; onI
   return <dialog ref={dialog} className="import-dialog" aria-labelledby="import-title" onCancel={(event) => { if (busy) event.preventDefault(); else onClose(); }}>
     <form onSubmit={(event) => { void submit(event); }}>
       <div className="dialog-heading"><div><span className="eyebrow">数据工作台</span><h2 id="import-title">导入时序数据</h2></div><button type="button" className="icon-button" aria-label="关闭导入窗口" onClick={onClose} disabled={busy}><X size={20} /></button></div>
-      <p className="muted">支持 UTF-8 / GB18030 编码；120–100,000 行、2–64 个数值变量。数据仅在本地处理。</p>
+      <p className="muted">支持 UTF-8 / GB18030 编码；1–100,000 行、2–64 个数值变量。可导入短推理批次；独立训练另行校验样本数。数据仅在本地处理。</p>
       <div className="import-steps" aria-label="导入流程"><span className="import-step-active"><b>1</b>选择数据</span><span className={preview ? 'import-step-active' : ''}><b>2</b>映射字段</span><span><b>3</b>完整校验</span></div>
       <label className={`file-drop import-dropzone ${file ? 'has-file' : ''} ${dragging ? 'import-dragging' : ''}`} htmlFor="csv-file"
         onDragEnter={event => { event.preventDefault(); if (!busy) { dragDepth.current += 1; setDragging(true); } }}
@@ -80,7 +80,7 @@ export function ImportDialog({ onClose, onImported }: { onClose: () => void; onI
       {previewError && <div className="import-preview-error" role="status"><AlertCircle size={15} /><span>{previewError} 仍可提交，由服务端完整校验。</span></div>}
       <label className="field">数据集名称 <span className="optional">可选</span><input name="name" placeholder="留空使用文件名称" maxLength={200} disabled={busy} /></label>
       <div className="form-grid"><label className="field">时间列名 <span className="optional">可选</span><select name="timestamp_column" aria-label="时间列名" value={timestampColumn} onChange={event => setTimestampColumn(event.target.value)} disabled={busy || previewLoading}><option value="">{preview?.timestampColumn ? `自动识别 · ${preview.timestampColumn}` : '自动识别 timestamp / 时间 等'}</option>{preview?.columns.map((column, index) => <option key={`${index}-${column}`} value={column}>{column || '空列名'}</option>)}</select></label><label className="field">标签列名 <span className="optional">可选</span><select name="label_column" aria-label="标签列名" value={labelColumn} onChange={event => setLabelColumn(event.target.value)} disabled={busy || previewLoading}><option value="">{preview?.labelColumn ? `自动识别 · ${preview.labelColumn}` : '自动识别 label / 标签 等'}</option>{preview?.columns.map((column, index) => <option key={`${index}-${column}`} value={column}>{column || '空列名'}</option>)}</select></label></div>
-      <div className="notice"><AlertCircle size={16} /><span>无时间列时使用样本序号。标签必须为 0/1，仅用于训练之后的评估，不参与阈值校准。缺失值使用历史拟合段中位数填补。</span></div>
+      <div className="notice"><AlertCircle size={16} /><span>无时间列时使用样本序号。标签必须为 0/1，仅用于可评分样本评估与训练污染提示，不自动调参。检测缺失值使用已选模型保存的中位数填补；时序模型的短批次可能全部不可评分 / 预热，不代表正常。</span></div>
       {error && <div className="error-banner" role="alert">{error}</div>}
       <div className="dialog-actions"><button type="button" className="button secondary" onClick={onClose} disabled={busy}>取消</button><button type="submit" className="button primary" data-testid="upload-submit" disabled={busy || !file || file.size > MAX_FILE_SIZE}>{busy ? <LoaderCircle className="spin" size={16} /> : <FileUp size={16} />}{busy ? '正在解析与校验' : '校验并导入'}</button></div>
     </form>

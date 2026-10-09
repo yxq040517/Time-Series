@@ -56,7 +56,7 @@ def is_our_server(url: str) -> bool:
     try:
         with urlopen(url + "/api/health", timeout=1) as response:
             body = json.load(response)
-        return body.get("status") == "ok" and body.get("version") == "1.0.0"
+        return body.get("status") == "ok" and body.get("version") == "2.0.0"
     except (URLError, TimeoutError, OSError, ValueError):
         return False
 
@@ -88,7 +88,7 @@ def main() -> int:
                 if not args.no_browser:
                     webbrowser.open(url)
                 return 0
-            raise RuntimeError(f"Port {args.port} is in use. Try start.bat --port 8768")
+            raise RuntimeError(f"Port {args.port} is occupied by an old ChronoLens version or another program. Stop the old service window or use start.bat --port 8768.")
         env = os.environ.copy()
         env.setdefault("OMP_NUM_THREADS", "2")
         env.setdefault("OPENBLAS_NUM_THREADS", "2")

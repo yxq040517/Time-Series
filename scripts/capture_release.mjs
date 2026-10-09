@@ -35,7 +35,7 @@ try{
  await page.getByRole('button',{name:'数据诊断',exact:true}).click();
  await page.getByTestId('profile-table').waitFor();
  await page.screenshot({path:path.join(out,'data-diagnostics.png'),fullPage:true});
- await page.getByRole('button',{name:'模型对比',exact:true}).click();
+ await page.getByRole('button',{name:'检测任务对比',exact:true}).click();
  await page.getByTestId('comparison-table').waitFor();
  await page.screenshot({path:path.join(out,'model-comparison.png'),fullPage:true});
  await page.getByRole('button',{name:'分析工作台',exact:true}).click();

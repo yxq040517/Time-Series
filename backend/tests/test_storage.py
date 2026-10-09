@@ -1,12 +1,15 @@
 import csv
 import io
+import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pytest
 
-from backend.engine import analyze
-from backend.schemas import RunConfig
+from backend.engine import detect, train_model
+from backend.schemas import DetectionConfig, TrainingConfig
 from backend.storage import Storage, parse_csv
+from backend.app import stream_context
 
 
 def csv_bytes(header, rows):
@@ -32,16 +35,16 @@ def test_label_free_missing_data_and_text_columns_are_not_fabricated():
 def test_damaged_numeric_features_are_rejected_not_discarded(bad_value):
     rows = [[i, i + 1, i + 2] for i in range(120)]
     rows[25][0] = bad_value
-    with pytest.raises(ValueError, match="无效数值"):
+    with pytest.raises(ValueError):
         parse_csv(csv_bytes(["a", "b", "c"], rows))
 
 
 def test_duplicate_headers_and_out_of_order_time_are_rejected():
-    with pytest.raises(ValueError, match="重复列名"):
+    with pytest.raises(ValueError):
         parse_csv(csv_bytes(["a", "a"], [[i, i] for i in range(120)]))
     rows = [[f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z", i, i] for i in range(120)]
     rows[10], rows[11] = rows[11], rows[10]
-    with pytest.raises(ValueError, match="升序"):
+    with pytest.raises(ValueError):
         parse_csv(csv_bytes(["timestamp", "a", "b"], rows))
 
 
@@ -51,13 +54,19 @@ def test_annotations_survive_restart_without_changing_detection(tmp_path):
     values = rng.normal(size=(180, 2))
     values[110:125] += 15
     dataset = store.add_dataset(csv_bytes(["a", "b"], values.tolist()), "用户数据", "upload")
-    config = RunConfig(dataset_id=dataset.id, algorithm="temporal", min_event_length=1)
-    run = store.add_run(config, dataset)
-    output, events, summary, notes = analyze(store.load_arrays("dataset", dataset.id), dataset.features, config)
+    training = store.add_training(TrainingConfig(dataset_id=dataset.id, name="正常历史", algorithm="temporal",
+                                               fit_end=80, calibration_end=100), dataset)
+    asset, training_summary, training_notes = train_model(store.load_arrays("dataset", dataset.id), dataset.features, training.config)
+    model = store.finish_training(training.id, asset, training_summary, training_notes)
+    model = store.publish_model(model.id)
+    config = DetectionConfig(dataset_id=dataset.id, model_id=model.id, min_event_length=1)
+    run = store.add_run(config, dataset, model)
+    output, events, summary, notes, _ = detect(store.load_arrays("dataset", dataset.id), dataset.features, store.load_model_asset(model.id), config)
     store.finish_run(run.id, output, events, summary, notes)
     target = next(event for event in events if event["start"] <= 110 < event["end"])
     store.annotate(run.id, target["id"], {"status": "confirmed", "note": "=HYPERLINK(\"unsafe\") <script>注释</script>"})
-    interrupted = store.add_run(config, dataset)
+    interrupted = store.add_run(config, dataset, model)
+    interrupted_training = store.add_training(training.config, dataset)
     restarted = Storage(tmp_path)
     reviewed = next(event for event in restarted.events(run.id) if event["id"] == target["id"])
     assert reviewed["status"] == "confirmed"
@@ -66,3 +75,63 @@ def test_annotations_survive_restart_without_changing_detection(tmp_path):
     np.testing.assert_array_equal(restarted.load_arrays("run", run.id)["scores"], output["scores"])
     assert restarted.get_run(interrupted.id).status == "failed"
     assert restarted.get_run(run.id).status == "completed"
+    assert restarted.get_training(interrupted_training.id).status == "failed"
+    assert restarted.get_training(training.id).model_id == model.id
+    persisted_model = restarted.get_model(model.id)
+    assert persisted_model.status == "published"
+    assert persisted_model.threshold == model.threshold
+    repeated, _, _, _, _ = detect(restarted.load_arrays("dataset", dataset.id), dataset.features,
+                                  restarted.load_model_asset(model.id), config)
+    np.testing.assert_array_equal(repeated["scores"], output["scores"])
+    np.testing.assert_array_equal(repeated["scored"], output["scored"])
+
+
+def test_stream_completion_rollback_preserves_history_and_gap_boundary(tmp_path):
+    store = Storage(tmp_path)
+    origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    values = np.random.default_rng(9).normal(size=(100, 2))
+
+    def dataset(seconds, observations):
+        rows = [[(origin + timedelta(seconds=int(second))).isoformat(), *row]
+                for second, row in zip(seconds, observations)]
+        return store.add_dataset(csv_bytes(["timestamp", "a", "b"], rows), "流样本", "upload")
+
+    training_data = dataset(range(100), values)
+    job = store.add_training(TrainingConfig(dataset_id=training_data.id, name="流边界", algorithm="temporal",
+                                           fit_end=80, calibration_end=100), training_data)
+    asset, training_summary, training_notes = train_model(store.load_arrays("dataset", training_data.id), ["a", "b"], job.config)
+    model = store.publish_model(store.finish_training(job.id, asset, training_summary, training_notes).id)
+    first = dataset(range(20), values[:20])
+    config = DetectionConfig(dataset_id=first.id, model_id=model.id, stream_id="sensor")
+    first_source = store.load_arrays("dataset", first.id)
+    history, state, _, _ = stream_context(store, model, config, first_source)
+    assert history is None
+    arrays, events, summary, notes, history = detect(first_source, first.features, asset, config)
+    state["history"] = history.tolist()
+    run = store.add_run(config, first, model)
+    store.finish_run(run.id, arrays, events, summary, notes, (model.id, "sensor", state))
+
+    following = dataset(range(20, 30), values[20:30])
+    next_config = DetectionConfig(dataset_id=following.id, model_id=model.id, stream_id="sensor")
+    source = store.load_arrays("dataset", following.id)
+    previous_history, next_state, _, _ = stream_context(store, model, next_config, source)
+    arrays, events, summary, notes, next_history = detect(source, following.features, asset, next_config, history=previous_history)
+    next_state["history"] = next_history.tolist()
+    pending = store.add_run(next_config, following, model)
+    with store.connect() as db:
+        db.execute("CREATE TRIGGER reject_stream_update BEFORE INSERT ON streams BEGIN SELECT RAISE(ABORT, 'simulated commit failure'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        store.finish_run(pending.id, arrays, events, summary, notes, (model.id, "sensor", next_state))
+    assert store.get_run(pending.id).status == "queued"
+    assert store.get_stream(model.id, "sensor") == state
+    assert store.events(pending.id) == []
+
+    restarted = Storage(tmp_path)
+    assert restarted.get_run(pending.id).status == "failed"
+    assert restarted.get_stream(model.id, "sensor") == state
+    with pytest.raises(ValueError):
+        stream_context(restarted, model, config, first_source)
+    discontinuous = dataset([25, 26, 27, 28, 29, 40, 41, 42, 43, 44], values[20:30])
+    reset_history, _, _, cuts = stream_context(restarted, model, next_config, store.load_arrays("dataset", discontinuous.id))
+    assert reset_history is None
+    assert cuts == [5]

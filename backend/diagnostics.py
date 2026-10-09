@@ -66,15 +66,26 @@ def dataset_profile(dataset: Dataset, source: dict) -> dict:
             "sampling": sampling, "warnings": warnings}
 
 
+def scored_mask(run: Run, output: dict) -> np.ndarray:
+    if "scored" in output:
+        return np.asarray(output["scored"], dtype=bool)
+    mask = np.ones(len(output["flags"]), dtype=bool)
+    mask[:run.summary.train_end or 0] = False
+    return mask
+
+
 def run_insights(run: Run, events: list[dict], source: dict, output: dict) -> dict:
     review = Counter(event["status"] for event in events)
     severity = Counter(event["severity"] for event in events)
     features = Counter(event["top_feature"] for event in events)
-    start, end = run.summary.train_end, len(output["flags"])
+    mask = scored_mask(run, output)
+    indices = np.flatnonzero(mask)
+    start, end = (int(indices[0]), len(mask)) if indices.size else (0, 0)
     edges = np.linspace(start, end, min(24, end - start) + 1, dtype=int)
     timeline = [{"start": int(a), "end": int(b), "label": str(source["timestamps"][a]),
-                 "anomaly_points": int(np.count_nonzero(output["flags"][a:b])), "total_points": int(b - a)}
-                for a, b in zip(edges[:-1], edges[1:])]
+                 "anomaly_points": int(np.count_nonzero(output["flags"][a:b][mask[a:b]])),
+                 "total_points": int(mask[a:b].sum())}
+                for a, b in zip(edges[:-1], edges[1:]) if mask[a:b].any()]
     return {"run_id": run.id,
             "review": {key: review[key] for key in ("unreviewed", "confirmed", "false_positive")},
             "severity": {key: severity[key] for key in ("high", "medium", "low")},

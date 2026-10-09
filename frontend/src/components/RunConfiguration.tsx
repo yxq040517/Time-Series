@@ -1,48 +1,37 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { ChevronDown, Play, SlidersHorizontal, LoaderCircle, Sparkles } from 'lucide-react';
-import type { Algorithm, RunConfig } from '../types';
-import { getRunPresetConfig, runPresets, type RunPresetId } from './runPresets';
+import { Play, SlidersHorizontal, LoaderCircle } from 'lucide-react';
+import { algorithmNames, algorithmDescriptions, modelCompatibility, type Dataset, type DetectionConfig, type ModelInfo } from '../types';
 
-export const algorithmNames: Record<Algorithm, string> = { pca: 'PCA 重构', temporal: '时序自回归', isolation: '孤立森林' };
-const descriptions: Record<Algorithm, string> = {
-  pca: '学习变量间的正常协同结构，使用重构残差检测偏离。最多保留变量数减一的主成分，确保存在残差方向；适合多变量相关性变化。',
-  temporal: '仅使用过去窗口预测当前值，使用 Ridge 自回归预测残差检测变化；不使用未来样本。',
-  isolation: '使用 IsolationForest 检测多变量空间中的稀有样本；变量解释为稳健偏离代理，不是模型精确归因。',
-};
-export function RunConfiguration({ datasetId, busy, onRun, initialConfig }: { datasetId: string; busy: boolean; onRun: (config: RunConfig) => void; initialConfig?: RunConfig }) {
-  const [config, setConfig] = useState<RunConfig>(() => initialConfig || getRunPresetConfig('balanced', datasetId));
-  const [preset, setPreset] = useState<RunPresetId | 'custom'>(initialConfig ? 'custom' : 'balanced');
-  const algorithm = config.algorithm;
+export function RunConfiguration({ dataset, models, busy, onRun, initialConfig, onTrain, modelLoading, modelError, onRefresh }: {
+  dataset: Dataset; models: ModelInfo[]; busy: boolean; onRun: (config: DetectionConfig) => void;
+  initialConfig?: DetectionConfig; onTrain: () => void; modelLoading: boolean; modelError: string; onRefresh: () => void;
+}) {
+  const usable = models.filter(model => model.status === 'published' && modelCompatibility(model, dataset.features).compatible);
+  const [modelId, setModelId] = useState(initialConfig?.model_id || '');
+  const [minLength, setMinLength] = useState(String(initialConfig?.min_event_length ?? 3));
+  const [mergeGap, setMergeGap] = useState(String(initialConfig?.merge_gap ?? 2));
+  const [streamId, setStreamId] = useState(initialConfig?.stream_id || '');
   useEffect(() => {
-    if (initialConfig) { setConfig(initialConfig); setPreset('custom'); }
+    if (initialConfig) { setModelId(initialConfig.model_id); setMinLength(String(initialConfig.min_event_length)); setMergeGap(String(initialConfig.merge_gap)); setStreamId(initialConfig.stream_id || ''); }
   }, [initialConfig]);
-  const changeParameter = (key: Exclude<keyof RunConfig, 'dataset_id' | 'algorithm'>, value: string, scale = 1) => {
-    setConfig(current => ({ ...current, [key]: value === '' ? Number.NaN : Number(value) / scale }));
-    setPreset('custom');
-  };
-  const numberValue = (key: Exclude<keyof RunConfig, 'dataset_id' | 'algorithm'>, scale = 1) => Number.isFinite(config[key]) ? Number((config[key] * scale).toFixed(4)) : '';
-  const choosePreset = (id: RunPresetId) => { setConfig(getRunPresetConfig(id, datasetId, algorithm)); setPreset(id); };
+  const model = usable.find(item => item.id === modelId);
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (busy) return;
-    onRun({ ...config, dataset_id: datasetId,
-      pca_variance: algorithm !== 'pca' && !Number.isFinite(config.pca_variance) ? 0.9 : config.pca_variance,
-      window: algorithm !== 'temporal' && !Number.isFinite(config.window) ? 8 : config.window,
-    });
+    if (busy || modelLoading || modelError || !model) return;
+    onRun({ dataset_id: dataset.id, model_id: model.id, min_event_length: Number(minLength), merge_gap: Number(mergeGap),
+      ...(model.algorithm === 'temporal' ? { stream_id: streamId.trim() || null } : {}) });
   };
-  return <section className="card configuration" id="configuration"><div className="card-heading"><div className="section-title"><SlidersHorizontal size={18} /><h2>检测配置</h2></div><span className="badge neutral">历史校准</span></div>
+  return <section className="card configuration" id="configuration"><div className="card-heading"><div className="section-title"><SlidersHorizontal size={18} /><h2>检测配置</h2></div><span className="badge neutral">固定模型推理</span></div>
+    {modelLoading && <p role="status">正在读取已发布模型…</p>}
+    {modelError && <div className="error-banner" role="alert">{modelError}<button className="text-button" onClick={onRefresh}>重试</button></div>}
+    {!modelLoading && !usable.length && <div className="notice"><span>没有已发布且变量兼容的模型。请先独立训练并发布，检测不会自动训练。<button className="text-button" data-testid="train-empty-action" onClick={onTrain}>前往模型训练</button></span></div>}
     <form onSubmit={submit}>
-      <div className="preset-heading"><span><Sparkles size={14} />参数预设</span><small>{preset === 'custom' ? '自定义参数' : '可继续微调'}</small></div>
-      <div className="preset-options" role="group" aria-label="检测参数预设">{runPresets.map(item => <button key={item.id} type="button" className={`preset-button ${preset === item.id ? 'active' : ''}`} aria-pressed={preset === item.id} aria-label={item.label} title={item.description} onClick={() => choosePreset(item.id)} disabled={busy}>{item.label}</button>)}</div>
-      <p className="preset-description">{preset === 'custom' ? '已调整配置。可复用历史参数，或选择预设重新开始。' : runPresets.find(item => item.id === preset)?.description}</p>
-      <label className="field">检测方法<select name="algorithm" aria-label="检测方法" data-testid="algorithm-select" value={algorithm} onChange={(event) => setConfig(current => ({ ...current, algorithm: event.target.value as Algorithm }))} disabled={busy}><option value="pca">PCA · 多变量重构残差</option><option value="temporal">时序自回归 · 历史窗口预测</option><option value="isolation">IsolationForest · 稀有样本检测</option></select></label>
-      <p className="method-description">{descriptions[algorithm]}</p>
-      <div className="form-grid"><label className="field">历史训练比例（%）<input type="number" name="train_ratio" aria-label="历史训练比例" min={15} max={70} step={1} value={numberValue('train_ratio', 100)} onChange={event => changeParameter('train_ratio', event.target.value, 100)} required disabled={busy} /></label><label className="field">阈值分位数（%）<input type="number" name="threshold_quantile" aria-label="阈值分位数" min={90} max={99.99} step={0.01} value={numberValue('threshold_quantile', 100)} onChange={event => changeParameter('threshold_quantile', event.target.value, 100)} required disabled={busy} /></label></div>
-      {algorithm === 'pca' && <label className="field">目标解释方差（%）<input type="number" name="pca_variance" aria-label="目标解释方差" min={50} max={99} step={1} value={numberValue('pca_variance', 100)} onChange={event => changeParameter('pca_variance', event.target.value, 100)} required disabled={busy} /></label>}
-      {algorithm === 'temporal' && <label className="field">历史窗口（样本）<input type="number" name="window" aria-label="历史窗口" min={2} max={32} step={1} value={numberValue('window')} onChange={event => changeParameter('window', event.target.value)} required disabled={busy} /></label>}
-      <details className="advanced"><summary><ChevronDown size={14} />事件合并设置</summary><div className="form-grid"><label className="field">最短事件（样本）<input type="number" name="min_event_length" aria-label="最短事件长度" min={1} max={50} value={numberValue('min_event_length')} onChange={event => changeParameter('min_event_length', event.target.value)} required disabled={busy} /></label><label className="field">合并间隔（样本）<input type="number" name="merge_gap" aria-label="事件合并间隔" min={0} max={20} value={numberValue('merge_gap')} onChange={event => changeParameter('merge_gap', event.target.value)} required disabled={busy} /></label></div></details>
-      <p className="training-note">假设初始训练段主要正常。阈值仅使用训练段内部的历史校准尾段，测试标签不参与建模。模型无法保证发现所有异常。</p>
-      <button className="button primary full-width" data-testid="run-button" disabled={busy} type="submit">{busy ? <LoaderCircle size={17} className="spin" /> : <Play size={17} />}{busy ? '正在处理，请稍候' : '开始异常检测'}</button>
+      <label className="field">已发布模型<select name="model_id" aria-label="已发布模型" data-testid="model-select" value={model?.id || ''} onChange={event => { setModelId(event.target.value); setStreamId(''); }} required disabled={busy || modelLoading || !!modelError}><option value="" disabled>选择与当前数据变量兼容的模型</option>{usable.map(item => <option key={item.id} value={item.id}>{item.name} · v{item.version} · {algorithmNames[item.algorithm]}</option>)}</select></label>
+      {model && <div className="fixed-model-parameters" data-testid="fixed-model-parameters"><strong>{algorithmNames[model.algorithm]} · v{model.version}</strong><p className="method-description">{algorithmDescriptions[model.algorithm]}</p><dl><dt>训练来源</dt><dd>{model.dataset_name}</dd><dt>拟合范围</dt><dd>#{model.fit_start}–#{model.fit_end - 1}</dd><dt>校准范围</dt><dd>#{model.fit_end}–#{model.calibration_end - 1}</dd><dt>固定阈值</dt><dd>{model.threshold.toPrecision(5)}（{(model.training_config.threshold_quantile * 100).toFixed(2)}% 校准分位数）</dd>{model.algorithm === 'pca' && <><dt>目标解释方差</dt><dd>{(model.training_config.pca_variance * 100).toFixed(1)}%</dd></>}{model.algorithm === 'temporal' && <><dt>固定历史窗口</dt><dd>{model.window} 样本</dd></>}<dt>变量契约</dt><dd>{model.features.join(' / ')}</dd></dl><p className="training-note">缺失值填补、中心与尺度、模型和阈值均来自此训练版本；新数据不参与拟合或校准。</p></div>}
+      <div className="form-grid"><label className="field">最短事件（样本）<input type="number" name="min_event_length" aria-label="最短事件长度" min={1} max={50} step={1} value={minLength} onChange={event => setMinLength(event.target.value)} required disabled={busy} /></label><label className="field">合并间隔（样本）<input type="number" name="merge_gap" aria-label="事件合并间隔" min={0} max={20} step={1} value={mergeGap} onChange={event => setMergeGap(event.target.value)} required disabled={busy} /></label></div>
+      {model?.algorithm === 'temporal' && <><label className="field">连续流 ID（可选）<input name="stream_id" aria-label="连续流 ID" maxLength={100} value={streamId} onChange={event => setStreamId(event.target.value)} placeholder="留空表示独立文件，每次重新预热" disabled={busy} /></label><p className="training-note">仅同一模型版本和同一流 ID 共享已成功检测的历史。时间必须递增；间断会重新预热。独立文件不借用训练尾段，不可评分点不代表正常。</p></>}
+      <button className="button primary full-width" data-testid="run-button" disabled={busy || modelLoading || !!modelError || !model} type="submit">{busy ? <LoaderCircle size={17} className="spin" /> : <Play size={17} />}{busy ? '正在处理，请稍候' : '开始异常检测'}</button>
     </form>
+    {!!models.length && <details className="quality-warning"><summary>模型可用性与变量兼容情况</summary><ul>{models.map(item => { const compatibility = modelCompatibility(item, dataset.features); return <li key={item.id}>{item.name} v{item.version}：{item.status === 'published' ? '已发布' : item.status === 'ready' ? '未发布' : '已停用'}；{compatibility.compatible ? '变量集合兼容（允许列重排）' : `缺少：${compatibility.missing.join('、') || '无'}；多余：${compatibility.unexpected.join('、') || '无'}`}</li>; })}</ul><button className="text-button" onClick={onTrain}>管理与训练模型</button></details>}
   </section>;
 }

@@ -49,13 +49,29 @@ try {
     file: { name: 'diagnostics-index.csv', mimeType: 'text/csv', buffer: Buffer.from(indexLines.join('\n')) },
   } }));
   const configs = [
-    { algorithm: 'pca', train_ratio: .35, threshold_quantile: .98 },
-    { algorithm: 'temporal', train_ratio: .45, threshold_quantile: .99, window: 4 },
-    { algorithm: 'isolation', train_ratio: .35, threshold_quantile: .99 },
-    { algorithm: 'pca', train_ratio: .4, threshold_quantile: .97 },
+    { algorithm: 'pca', threshold_quantile: .98 },
+    { algorithm: 'temporal', threshold_quantile: .99, window: 4 },
+    { algorithm: 'isolation', threshold_quantile: .99 },
+    { algorithm: 'pca', threshold_quantile: .97 },
   ];
   const created = [];
-  for (const config of configs) created.push(await json(await page.request.post(`${base}/api/runs`, { data: { dataset_id: primary.id, ...config } }), 202));
+  for (const [index, config] of configs.entries()) {
+    const training = await json(await page.request.post(`${base}/api/trainings`, { data: {
+      dataset_id: primary.id, name: `Diagnostics ${index} ${Date.now()}`, fit_start: 0, fit_end: 100,
+      calibration_end: 140, pca_variance: .9, window: 8, ...config,
+    } }), 202);
+    let modelId;
+    for (let attempt = 0; attempt < 300; attempt++) {
+      const job = await json(await page.request.get(`${base}/api/trainings/${training.id}`));
+      assert.notEqual(job.status, 'failed', job.error || job.message);
+      if (job.status === 'completed') { modelId = job.model_id; break; }
+      await sleep(100);
+    }
+    assert.ok(modelId, 'training must produce a durable model');
+    await json(await page.request.post(`${base}/api/models/${modelId}/publish`));
+    created.push(await json(await page.request.post(`${base}/api/runs`, { data: { dataset_id: primary.id,
+      model_id: modelId, min_event_length: 3, merge_gap: 2 } }), 202));
+  }
   const completed = await Promise.all(created.map((run) => awaitRun(run.id)));
   evidence.fixture = { datasetId: primary.id, indexDatasetId: indexDataset.id, runIds: completed.map((run) => run.id) };
   const profile = await json(await page.request.get(`${base}/api/datasets/${primary.id}/profile`));
@@ -96,7 +112,7 @@ try {
   await page.screenshot({ path: path.join(out, 'diagnostics-desktop.png'), fullPage: true });
   evidence.profileActualTableValuesAndSearch = true;
 
-  await page.getByRole('button', { name: '模型对比', exact: true }).click();
+  await page.getByRole('button', { name: '检测任务对比', exact: true }).click();
   const checkboxes = page.locator('[data-testid^="comparison-run-"]');
   await checkboxes.first().waitFor();
   assert.equal(await checkboxes.count(), 4);
@@ -163,7 +179,7 @@ try {
     await page.getByTestId('profile-feature-count').waitFor();
     await noOverflow();
     if (width === 390) await page.screenshot({ path: path.join(out, 'diagnostics-mobile.png'), fullPage: true });
-    await page.getByRole('button', { name: '模型对比', exact: true }).click();
+    await page.getByRole('button', { name: '检测任务对比', exact: true }).click();
     await page.getByTestId('comparison-table').waitFor();
     await noOverflow();
     if (width === 390) await page.screenshot({ path: path.join(out, 'comparison-mobile.png'), fullPage: true });

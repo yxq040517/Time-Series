@@ -13,3 +13,4 @@ artifacts/
 coverage/
 .coverage
 htmlcov/
+datasets/SMD/
